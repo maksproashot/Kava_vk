@@ -23,8 +23,8 @@ creds_json = json.loads(os.getenv("GOOGLE_CREDS"))
 client = gspread.service_account_from_dict(creds_json)
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
-sheet_clients = client.open_by_key(SPREADSHEET_ID).worksheet("Clients")
-sheet_history = client.open_by_key(SPREADSHEET_ID).worksheet("History")
+sheet_clients = client.open_by_key("1O7qRycSy83KXIIjQajQsVSRD3XtenYFmuDCnBK2PPkc").worksheet("Clients")
+sheet_history = client.open_by_key("1O7qRycSy83KXIIjQajQsVSRD3XtenYFmuDCnBK2PPkc").worksheet("History")
 
 # ---------------- Функции работы с Google Sheets ----------------
 def normalize_phone(raw: str) -> str | None:
