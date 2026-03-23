@@ -16,7 +16,6 @@ logging.basicConfig(level=logging.INFO)
 VK_TOKEN = os.getenv("VK_TOKEN")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID")
 VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN") # Добавлено
-ALLOWED_USERS = set(map(int, os.getenv("ALLOWED_USERS", "").split(","))) if os.getenv("ALLOWED_USERS") else set()
 
 # Google Sheets
 creds_json = json.loads(os.getenv("GOOGLE_CREDS"))
