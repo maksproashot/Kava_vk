@@ -4,15 +4,18 @@ import re
 import logging
 from datetime import datetime, timedelta
 import gspread
-from vkbottle.bot import Bot, Message
-from vkbottle import Keyboard, Text, GroupEventType
-from vkbottle.dispatch.rules.base import FromUserRule
+# Импорты для веб-сервера
+from aiohttp import web
+import aiohttp
+# Импорты vkbottle для работы с payload и клавиатурой
+from vkbottle import Keyboard, Text
 
 logging.basicConfig(level=logging.INFO)
 
 # ---------------- Настройки ----------------
 VK_TOKEN = os.getenv("VK_TOKEN")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID")
+VK_CONFIRMATION_TOKEN = os.getenv("VK_CONFIRMATION_TOKEN") # Добавлено
 ALLOWED_USERS = set(map(int, os.getenv("ALLOWED_USERS", "").split(","))) if os.getenv("ALLOWED_USERS") else set()
 
 # Google Sheets
@@ -135,7 +138,7 @@ def update_client(phone: str, action: str):
         bonuses = max(0, bonuses - 1)
 
     sheet_clients.update_cell(row_idx, 2, str(visits))
-    sheet_clients.update_cell(row_idx, 3uses))
+    sheet_clients.update_cell(row_idx, 3, str(bonuses))
 
     sheet_history.append_row([
        (datetime.now() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
@@ -192,133 +195,171 @@ def client_keyboard(phone: str):
     )
     return keyboard.get_json()
 
-# ---------------- Инициализация бота ----------------
-bot = Bot(token=VK_TOKEN)
+# ---------------- Отправка сообщения ----------------
+async def send_message(user_id, message, keyboard=None):
+    params = {
+        "access_token": VK_TOKEN,
+        "v": "5.131",
+        "user_id": user_id,
+        "message": message,
+        "random_id": 0,
+    }
+    if keyboard:
+        params["keyboard"] = keyboard
 
-# ---------------- Хендлеры ----------------
-@bot.on.message(text="/start")
-async def start_handler(message: Message):
-    if message.from_id not in ALLOWED_USERS:
-        await message.answer("❌ У вас нет доступа к этому боту.")
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://api.vk.com/method/messages.send", data=params) as resp:
+            result = await resp.text()
+            logging.info(f"Sent message to {user_id}, response: {result}")
+
+# ---------------- Обработка событий из ВК ----------------
+async def handle_message_event(event_data):
+    message = event_data['object']['message']
+    user_id = message['from_id']
+    text = message.get('text', '')
+    payload_raw = message.get('payload')
+
+    # Проверка доступа
+    if user_id not in ALLOWED_USERS:
+        await send_message(user_id, "❌ У вас нет доступа к этому боту.")
         return
 
-    await message.answer(
-        "Привет! ☕\n"
-        "Введи номер телефона клиента (например, +79991234567 или 89991234567), "
-        "и я покажу его покупки и бонусы.\n\n"
-        "Также можно использовать команду:\n"
-        "/history +79991234567 — чтобы посмотреть последние 5 операций."
-    )
-
-@bot.on.message(text="/buy <phone>")
-async def buy_handler(message: Message, phone: str):
-    if message.from_id not in ALLOWED_USERS:
-        await message.answer("❌ У вас нет доступа к этому боту.")
-        return
-
-    norm = normalize_phone(phone)
-    if not norm:
-        await message.answer("Невалидный формат номера. Пример: +79991234567 или 89991234567")
-        return
-
-    try:
-        visits, bonuses = add_visit(norm)
-        await message.answer(
-            f"☕ Покупка учтена!\n"
-            f"📱 {norm}\n"
-            f"Покупок до подарка: {6 - visits}\n"
-            f"Бонусов накоплено: {bonuses}"
-        )
-    except Exception:
-        await message.answer("⚠️ Ошибка при обновлении данных. Попробуй позже.")
-
-@bot.on.message(text="/history <phone>")
-async def history_handler(message: Message, phone: str):
-    if message.from_id not in ALLOWED_USERS:
-        await message.answer("❌ У вас нет доступа к этому боту.")
-        return
-
-    norm = normalize_phone(phone)
-    if not norm:
-        await message.answer("❌ Неверный формат номера. Пример: /history +79991234567")
-        return
-
-    history = get_history_by_phone(norm, limit=5)
-    if history:
-        text = f"📜 История операций для {norm}:\n"
-        for row in history:
-            date = row.get("timestamp", "N/A")
-            action = row.get("action", "N/A")
-            text += f"- {date}: {action}\n"
-        await message.answer(text)
-    else:
-        await message.answer("❌ История для этого номера не найдена.")
-
-@bot.on.message(FromUserRule(), regexp=r"^\+7\d{10}$|^\d{10}$|^8\d{10}$")
-async def phone_lookup_handler(message: Message):
-    if message.from_id not in ALLOWED_USERS:
-        await message.answer("❌ У вас нет доступа к этому боту.")
-        return
-
-    text = message.text or ""
-    norm = normalize_phone(text)
-    if not norm:
-        return
-
-    row_idx, row = find_client_row(norm)
-    if row_idx is None:
+    # Парсим payload, если он есть
+    payload = None
+    if payload_raw:
         try:
-            sheet_clients.append_row([norm, 0, 0])
-            row_idx, row = find_client_row(norm)
-            await message.answer(
-                f"✅ Новый клиент добавлен!\n"
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            logging.warning(f"Invalid payload received: {payload_raw}")
+            return
+
+    # Обработка команд
+    if text.lower() == '/start':
+        response_text = (
+            "Привет! ☕\n"
+            "Введи номер телефона клиента (например, +79991234567 или 89991234567), "
+            "и я покажу его покупки и бонусы.\n\n"
+            "Также можно использовать команду:\n"
+            "/history +79991234567 — чтобы посмотреть последние 5 операций."
+        )
+        await send_message(user_id, response_text)
+
+    elif text.startswith('/buy '):
+        phone = text[len('/buy '):].strip()
+        norm = normalize_phone(phone)
+        if not norm:
+            await send_message(user_id, "Невалидный формат номера. Пример: +79991234567 или 89991234567")
+            return
+
+        try:
+            visits, bonuses = add_visit(norm)
+            response_text = (
+                f"☕ Покупка учтена!\n"
                 f"📱 {norm}\n"
-                f"Покупок: 0\n"
-                f"Бонусов: 0\n"
-                f"До подарочного кофе: 6"
+                f"Покупок до подарка: {6 - visits}\n"
+                f"Бонусов накоплено: {bonuses}"
             )
+            await send_message(user_id, response_text)
+        except Exception:
+            await send_message(user_id, "⚠️ Ошибка при обновлении данных. Попробуй позже.")
+
+    elif text.startswith('/history '):
+        phone = text[len('/history '):].strip()
+        norm = normalize_phone(phone)
+        if not norm:
+            await send_message(user_id, "❌ Неверный формат номера. Пример: /history +79991234567")
             return
+
+        history = get_history_by_phone(norm, limit=5)
+        if history:
+            text_history = f"📜 История операций для {norm}:\n"
+            for row in history:
+                date = row.get("timestamp", "N/A")
+                action = row.get("action", "N/A")
+                text_history += f"- {date}: {action}\n"
+            await send_message(user_id, text_history)
+        else:
+            await send_message(user_id, "❌ История для этого номера не найдена.")
+
+    # Обработка нажатия кнопки (payload)
+    elif payload and "cmd" in payload:
+        action = payload.get("cmd")
+        phone = payload.get("phone")
+        if not phone or not action:
+            await send_message(user_id, "⚠️ Ошибка обработки кнопки.")
+            return
+
+        try:
+            visits, bonuses = update_client(phone, action)
+            response_text = (
+                f"📱 {phone}\n"
+                f"Покупок: {visits}\n"
+                f"Бонусов: {bonuses}\n"
+                f"До подарочного кофе: {6 - visits}"
+            )
+            await send_message(user_id, response_text, keyboard=client_keyboard(phone))
         except Exception as e:
-            logging.exception("Ошибка при добавлении нового клиента: %s", e)
-            await message.answer("⚠️ Не удалось добавить клиента в базу. Попробуй позже.")
+            logging.exception(f"Ошибка при обработке кнопки: {e}")
+            await send_message(user_id, "⚠️ Ошибка обновления")
+
+    # Обработка ввода номера телефона
+    elif re.match(r"^\+7\d{10}$|^\d{10}$|^8\d{10}$", text):
+        norm = normalize_phone(text)
+        if not norm:
             return
 
-    visits = int(row.get("visits") or 0)
-    bonuses = int(row.get("bonuses") or 0)
-    await message.answer(
-        f"📱 {norm}\n"
-        f"Покупок: {visits}\n"
-        f"Бонусов: {bonuses}\n"
-        f"До подарочного кофе: {6 - visits}",
-        keyboard=client_keyboard(norm)
-    )
+        row_idx, row = find_client_row(norm)
+        if row_idx is None:
+            try:
+                sheet_clients.append_row([norm, 0, 0])
+                row_idx, row = find_client_row(norm)
+                await send_message(user_id, (
+                    f"✅ Новый клиент добавлен!\n"
+                    f"📱 {norm}\n"
+                    f"Покупок: 0\n"
+                    f"Бонусов: 0\n"
+                    f"До подарочного кофе: 6"
+                ))
+                return
+            except Exception as e:
+                logging.exception("Ошибка при добавлении нового клиента: %s", e)
+                await send_message(user_id, "⚠️ Не удалось добавить клиента в базу. Попробуй позже.")
+                return
 
-@bot.on.message(payload={"cmd": True})
-async def button_handler(message: Message):
-    if message.from_id not in ALLOWED_USERS:
-        await message.answer("❌ У вас нет доступа к этому боту.")
-        return
-
-    payload = message.payload
-    action = payload.get("cmd")
-    phone = payload.get("phone")
-
-    if not phone or not action:
-        return
-
-    try:
-        visits, bonuses = update_client(phone, action)
-
-        await message.answer(
-            f"📱 {phone}\n"
+        visits = int(row.get("visits") or 0)
+        bonuses = int(row.get("bonuses") or 0)
+        await send_message(user_id, (
+            f"📱 {norm}\n"
             f"Покупок: {visits}\n"
             f"Бонусов: {bonuses}\n"
-            f"До подарочного кофе: {6 - visits}",
-            keyboard=client_keyboard(phone)
-        )
-    except Exception as e:
-        logging.exception(f"Ошибка при обработке кнопки: {e}")
-        await message.answer("⚠️ Ошибка обновления")
+            f"До подарочного кофе: {6 - visits}"
+        ), keyboard=client_keyboard(norm))
+
+# ---------------- Веб-сервер (aiohttp) ----------------
+async def handle_callback(request):
+    data = await request.json()
+
+    # Подтверждение webhook
+    if data.get('type') == 'confirmation':
+        logging.info("Received confirmation request from VK.")
+        return web.Response(text=VK_CONFIRMATION_TOKEN) # Возвращаем токен подтверждения
+
+    # Обработка нового сообщения
+    elif data.get('type') == 'message_new':
+        logging.info(f"Received message_new event: {data}")
+        await handle_message_event(data)
+        # Обязательно вернуть "ok"
+        return web.Response(text='ok')
+
+    # На другие типы событий тоже нужно отвечать "ok", если они вам не интересны
+    # Или можно просто вернуть "ok" всегда, если вы не ожидаете других типов
+    logging.info(f"Received unknown event type: {data.get('type')}")
+    return web.Response(text='ok')
+
+app = web.Application()
+app.router.add_post('/callback', handle_callback)
 
 if __name__ == "__main__":
-    bot.run_forever()
+    # Запуск сервера (укажите порт из переменной окружения, например, на Render)
+    port = int(os.getenv("PORT", 8000))
+    web.run_app(app, host="0.0.0.0", port=port)
