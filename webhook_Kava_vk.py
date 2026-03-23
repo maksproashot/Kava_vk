@@ -357,10 +357,7 @@ async def handle_callback(request):
     logging.info(f"Received unknown event type: {data.get('type')}")
     return web.Response(text='ok')
 
-app = web.Application()
-app.router.add_post('/callback', handle_callback)
-
-# --- Маршрут для проверки состояния ---
+# --- Маршрут для проверки состояния (Uptime Robot) ---
 async def handle_health_check(request):
     """Простой эндпоинт для проверки состояния."""
     # Можно просто вернуть "OK", если сервер запущен
@@ -369,8 +366,8 @@ async def handle_health_check(request):
 
 app = web.Application()
 app.router.add_post('/callback', handle_callback)
-# Добавляем маршрут для проверки состояния
-app.router.add_get('/health', handle_health_check) # <-- Должно быть так
+# Добавляем маршрут для проверки состояния, доступный по GET-запросу
+app.router.add_get('/health', handle_health_check)
 
 if __name__ == "__main__":
     # Запуск сервера (укажите порт из переменной окружения, например, на Render)
