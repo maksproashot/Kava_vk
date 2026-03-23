@@ -1,0 +1,324 @@
+import os
+import json
+import re
+import logging
+from datetime import datetime, timedelta
+import gspread
+from vkbottle.bot import Bot, Message
+from vkbottle import Keyboard, Text, GroupEventType
+from vkbottle.dispatch.rules.base import FromUserRule
+
+logging.basicConfig(level=logging.INFO)
+
+# ---------------- Настройки ----------------
+VK_TOKEN = os.getenv("VK_TOKEN")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID")
+ALLOWED_USERS = set(map(int, os.getenv("ALLOWED_USERS", "").split(","))) if os.getenv("ALLOWED_USERS") else set()
+
+# Google Sheets
+creds_json = json.loads(os.getenv("GOOGLE_CREDS"))
+client = gspread.service_account_from_dict(creds_json)
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+sheet_clients = client.open_by_key(SPREADSHEET_ID).worksheet("Clients")
+sheet_history = client.open_by_key(SPREADSHEET_ID).worksheet("History")
+
+# ---------------- Функции работы с Google Sheets ----------------
+def normalize_phone(raw: str) -> str | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    s = re.sub(r"[^\d+]", "", s)
+    if s.startswith("+"):
+        if s.startswith("+7") and len(s) == 12:
+            return s
+        digits = re.sub(r"[^\d]", "", s)
+        if digits.startswith("7") and len(s) == 11:
+            return "+" + digits
+        return s
+    if s.startswith("8") and len(s) == 11:
+        return "+7" + s[1:]
+    if s.startswith("7") and len(s) == 11:
+        return "+7" + s[1:]
+    if len(s) == 10:
+        return "+7" + s
+    return None
+
+def find_client_row(phone: str):
+    norm = normalize_phone(phone)
+    if not norm:
+        return None, None
+    try:
+        records = sheet_clients.get_all_records()
+    except Exception as e:
+        logging.exception("Ошибка чтения листа Clients: %s", e)
+        return None, None
+
+    for idx, row in enumerate(records, start=2):
+        row_phone = normalize_phone(str(row.get("phone") or ""))
+        if row_phone == norm:
+            return idx, row
+    return None, None
+
+def ensure_client_exists(phone: str):
+    norm = normalize_phone(phone)
+    if not norm:
+        return None, None
+    row_idx, row = find_client_row(norm)
+    if row_idx is not None:
+        return row_idx, row
+    try:
+        sheet_clients.append_row([norm, 0, 0])
+    except Exception as e:
+        logging.exception("Ошибка при добавлении новой строки в Clients: %s", e)
+        return None, None
+    return find_client_row(norm)
+
+def add_visit(phone: str):
+    norm = normalize_phone(phone)
+    if not norm:
+        raise ValueError("Невалидный номер")
+
+    row_idx, row = find_client_row(norm)
+    if row_idx is None:
+        try:
+            sheet_clients.append_row([norm, 1, 0])
+        except Exception as e:
+            logging.exception("Ошибка при добавлении клиента (add_visit): %s", e)
+            raise
+        return 1, 0
+
+    visits = int(row.get("visits") or 0) + 1
+    bonuses = int(row.get("bonuses") or 0)
+
+    if visits >= 6:
+        visits = 0
+        bonuses += 1
+
+    try:
+        sheet_clients.update_cell(row_idx, 2, str(visits))
+        sheet_clients.update_cell(row_idx, 3, str(bonuses))
+    except Exception as e:
+        logging.exception("Ошибка при обновлении visits/bonuses: %s", e)
+        raise
+
+    sheet_history.append_row([
+       (datetime.now() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        norm,
+        "add_visit",
+        visits,
+        bonuses
+    ])
+    limit_history_rows(5000)
+
+    return visits, bonuses
+
+def update_client(phone: str, action: str):
+    norm = normalize_phone(phone)
+    if not norm:
+        raise ValueError("Невалидный номер")
+
+    row_idx, row = ensure_client_exists(norm)
+    visits = int(row.get("visits") or 0)
+    bonuses = int(row.get("bonuses") or 0)
+
+    if action == "add_visit":
+        visits += 1
+        if visits >= 6:
+            visits = 0
+            bonuses += 1
+    elif action == "remove_visit":
+        visits = max(0, visits - 1)
+    elif action == "add_bonus":
+        bonuses += 1
+    elif action == "spend_bonus":
+        bonuses = max(0, bonuses - 1)
+
+    sheet_clients.update_cell(row_idx, 2, str(visits))
+    sheet_clients.update_cell(row_idx, 3uses))
+
+    sheet_history.append_row([
+       (datetime.now() + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        norm,
+        action,
+        visits,
+        bonuses
+    ])
+
+    limit_history_rows(5000)
+
+    return visits, bonuses
+
+def get_history_by_phone(phone: str, limit: int = 5):
+    records = sheet_history.get_all_records()
+    history = []
+    for r in records:
+        raw_phone_in_sheet = str(r.get("phone") or "")
+        norm_phone_in_sheet = normalize_phone(raw_phone_in_sheet)
+        if norm_phone_in_sheet == phone:
+            history.append(r)
+
+    try:
+        history.sort(key=lambda x: datetime.strptime(x["timestamp"], "%Y-%m-%d %H:%M:%S"), reverse=True)
+    except Exception as e:
+        logging.error(f"Error sorting history: {e}")
+
+    return history[:limit]
+
+def limit_history_rows(max_rows: int):
+    records = sheet_history.get_all_records()
+    total = len(records)
+    if total > max_rows:
+        rows_to_delete = total - max_rows
+        start_row = 2
+        end_row = start_row + rows_to_delete - 1
+        try:
+            sheet_history.delete_rows(start_row, end_row)
+            logging.info(f"Удалено {rows_to_delete} старых строк из History.")
+        except Exception as e:
+            logging.error(f"Ошибка при удалении строк из History: {e}")
+
+# ---------------- Клавиатура ----------------
+def client_keyboard(phone: str):
+    keyboard = (
+        Keyboard(one_time=False)
+        .add(Text(label="☕ Добавить покупку", payload={"cmd": "add_visit", "phone": phone}))
+        .row()
+        .add(Text(label="➖ Убрать покупку", payload={"cmd": "remove_visit", "phone": phone}))
+        .row()
+        .add(Text(label="🎁 Добавить бонус", payload={"cmd": "add_bonus", "phone": phone}))
+        .row()
+        .add(Text(label="🔻 Списать бонус", payload={"cmd": "spend_bonus", "phone": phone}))
+    )
+    return keyboard.get_json()
+
+# ---------------- Инициализация бота ----------------
+bot = Bot(token=VK_TOKEN)
+
+# ---------------- Хендлеры ----------------
+@bot.on.message(text="/start")
+async def start_handler(message: Message):
+    if message.from_id not in ALLOWED_USERS:
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+
+    await message.answer(
+        "Привет! ☕\n"
+        "Введи номер телефона клиента (например, +79991234567 или 89991234567), "
+        "и я покажу его покупки и бонусы.\n\n"
+        "Также можно использовать команду:\n"
+        "/history +79991234567 — чтобы посмотреть последние 5 операций."
+    )
+
+@bot.on.message(text="/buy <phone>")
+async def buy_handler(message: Message, phone: str):
+    if message.from_id not in ALLOWED_USERS:
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+
+    norm = normalize_phone(phone)
+    if not norm:
+        await message.answer("Невалидный формат номера. Пример: +79991234567 или 89991234567")
+        return
+
+    try:
+        visits, bonuses = add_visit(norm)
+        await message.answer(
+            f"☕ Покупка учтена!\n"
+            f"📱 {norm}\n"
+            f"Покупок до подарка: {6 - visits}\n"
+            f"Бонусов накоплено: {bonuses}"
+        )
+    except Exception:
+        await message.answer("⚠️ Ошибка при обновлении данных. Попробуй позже.")
+
+@bot.on.message(text="/history <phone>")
+async def history_handler(message: Message, phone: str):
+    if message.from_id not in ALLOWED_USERS:
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+
+    norm = normalize_phone(phone)
+    if not norm:
+        await message.answer("❌ Неверный формат номера. Пример: /history +79991234567")
+        return
+
+    history = get_history_by_phone(norm, limit=5)
+    if history:
+        text = f"📜 История операций для {norm}:\n"
+        for row in history:
+            date = row.get("timestamp", "N/A")
+            action = row.get("action", "N/A")
+            text += f"- {date}: {action}\n"
+        await message.answer(text)
+    else:
+        await message.answer("❌ История для этого номера не найдена.")
+
+@bot.on.message(FromUserRule(), regexp=r"^\+7\d{10}$|^\d{10}$|^8\d{10}$")
+async def phone_lookup_handler(message: Message):
+    if message.from_id not in ALLOWED_USERS:
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+
+    text = message.text or ""
+    norm = normalize_phone(text)
+    if not norm:
+        return
+
+    row_idx, row = find_client_row(norm)
+    if row_idx is None:
+        try:
+            sheet_clients.append_row([norm, 0, 0])
+            row_idx, row = find_client_row(norm)
+            await message.answer(
+                f"✅ Новый клиент добавлен!\n"
+                f"📱 {norm}\n"
+                f"Покупок: 0\n"
+                f"Бонусов: 0\n"
+                f"До подарочного кофе: 6"
+            )
+            return
+        except Exception as e:
+            logging.exception("Ошибка при добавлении нового клиента: %s", e)
+            await message.answer("⚠️ Не удалось добавить клиента в базу. Попробуй позже.")
+            return
+
+    visits = int(row.get("visits") or 0)
+    bonuses = int(row.get("bonuses") or 0)
+    await message.answer(
+        f"📱 {norm}\n"
+        f"Покупок: {visits}\n"
+        f"Бонусов: {bonuses}\n"
+        f"До подарочного кофе: {6 - visits}",
+        keyboard=client_keyboard(norm)
+    )
+
+@bot.on.message(payload={"cmd": True})
+async def button_handler(message: Message):
+    if message.from_id not in ALLOWED_USERS:
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+
+    payload = message.payload
+    action = payload.get("cmd")
+    phone = payload.get("phone")
+
+    if not phone or not action:
+        return
+
+    try:
+        visits, bonuses = update_client(phone, action)
+
+        await message.answer(
+            f"📱 {phone}\n"
+            f"Покупок: {visits}\n"
+            f"Бонусов: {bonuses}\n"
+            f"До подарочного кофе: {6 - visits}",
+            keyboard=client_keyboard(phone)
+        )
+    except Exception as e:
+        logging.exception(f"Ошибка при обработке кнопки: {e}")
+        await message.answer("⚠️ Ошибка обновления")
+
+if __name__ == "__main__":
+    bot.run_forever()
